@@ -1,4 +1,8 @@
-# 6f76aeb8b1076ee8462f15d192ed54b03770cb30
+# todoist_add.py
+# Create Todoist tasks from the *latest downloaded* CSV (by creation time) or an explicit --csv path.
+# CSV expects at least a CONTENT column; optional: DUE_DATE (YYYY-MM-DD), DUE_TIME (HH:MM 24h), PRIORITY (P1..P4 or 1..4), DESCRIPTION.
+# CONTENT supports inline tags (@tag) and section (/WeekX or /Week_X), e.g.:
+#   ENGG2112 Coding Quiz @course @ENGG2112 /Week7
 
 import os, csv, glob, sys, datetime, re, argparse
 from pathlib import Path
@@ -7,19 +11,34 @@ from zoneinfo import ZoneInfo
 import requests
 
 API = "https://api.todoist.com/rest/v2"
-TOKEN = os.getenv("TODOIST_TOKEN")
-if not TOKEN:
-    print("ERROR: Set your token first: export TODOIST_TOKEN=YOUR_TODOIST_TOKEN")
-    sys.exit(1)
-
-HEADERS = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
 
 # ---- Adjust if needed ----
-PROJECT_NAME = "Course"           # target project name
-LOCAL_TZ = "Australia/Sydney"     # for due_datetime
+PROJECT_NAME = "Course"           # Target project
+LOCAL_TZ = "Australia/Sydney"     # For timed tasks
 # --------------------------
 
-# ---------- CSV discovery (latest by creation time / Date Added) ----------
+# ---------- Token handling ----------
+def load_token(cli_token: str | None) -> str:
+    # 1) CLI --token
+    if cli_token:
+        return cli_token.strip()
+
+    # 2) Environment variable
+    env = os.getenv("TODOIST_TOKEN")
+    if env:
+        return env.strip()
+
+    # 3) (Optional) hardcode fallback — put your token string here if you *really* want*
+    HARDCODED = ""  # e.g., "6f76aeb8b1076ee8462f15d192ed54b03770cb30"
+    if HARDCODED:
+        return HARDCODED.strip()
+
+    print("ERROR: Set your token (use --token or export TODOIST_TOKEN=...)")
+    sys.exit(1)
+
+HEADERS = None  # will be set in main() after token is loaded
+
+# ---------- CSV discovery (latest by creation time / “Date Added”) ----------
 def _candidate_csvs(paths: List[Path]) -> List[str]:
     files = []
     for p in paths:
@@ -31,7 +50,7 @@ def _candidate_csvs(paths: List[Path]) -> List[str]:
 
 def _file_created(path: str) -> float:
     st = os.stat(path)
-    # macOS/APFS exposes creation time (birthtime)
+    # macOS/APFS: creation time (birthtime); fallback to mtime if not available
     return getattr(st, "st_birthtime", None) or st.st_mtime
 
 def latest_downloaded_csv(explicit: str | None = None) -> str:
@@ -50,14 +69,13 @@ def latest_downloaded_csv(explicit: str | None = None) -> str:
             return cands[0]
         raise FileNotFoundError(f"--csv path not found: {p}")
 
-    # 2) Search common Downloads locations (hardcode your user path first)
+    # 2) Search common Downloads locations (hardcode first)
     candidates = [
         Path("/Users/rajdipshah/Downloads"),
         Path("~/Downloads"),
         Path("~/Library/Mobile Documents/com~apple~CloudDocs/Downloads"),  # iCloud Downloads
     ]
     csvs = _candidate_csvs(candidates)
-    print("DEBUG: CSVs found:", csvs)
     if not csvs:
         raise FileNotFoundError("No CSV files found in any Downloads folder.")
     csvs.sort(key=_file_created, reverse=True)
@@ -65,7 +83,7 @@ def latest_downloaded_csv(explicit: str | None = None) -> str:
     return csvs[0]
 
 # ---------- Todoist helpers ----------
-def get_project_id(name: str) -> int:
+def get_project_id(name: str, headers: dict) -> int:
     r = requests.get(f"{API}/projects", headers=HEADERS)
     r.raise_for_status()
     for p in r.json():
@@ -87,11 +105,11 @@ def to_priority(val) -> int:
         return 4
     return {1:4, 2:3, 3:2, 4:1}[int(s)]
 
+# Only build an ISO datetime if BOTH date & time are given
 def to_iso(date_s: str | None, time_s: str | None) -> str | None:
-    """Return ISO-8601 with local offset, or None if no date."""
     date_s = (date_s or "").strip()
-    time_s = (time_s or "23:59").strip()
-    if not date_s:
+    time_s = (time_s or "").strip()
+    if not date_s or not time_s:
         return None
     dt = datetime.datetime.strptime(f"{date_s} {time_s}", "%Y-%m-%d %H:%M")
     return dt.replace(tzinfo=ZoneInfo(LOCAL_TZ)).isoformat()
@@ -101,10 +119,10 @@ SECTION_PAT = re.compile(r"^/(week[_ ]?\d+)$", re.IGNORECASE)
 
 def parse_content(content: str):
     """
-    CONTENT example: "OOP ED Task submitted? @course @oop /Week2"
+    CONTENT example: "ENGG2112 Coding Quiz @course @ENGG2112 /Week7"
     Returns: (title:str, labels:list[str], section_name:str|None)
     - tags: tokens starting with '@'
-    - section: '/Week2' or '/Week_2' (case-insensitive) -> normalized to 'Week2'
+    - section: '/Week7' or '/Week_7' -> normalized to 'Week7'
     """
     if not content or not content.strip():
         return "", [], None
@@ -120,9 +138,9 @@ def parse_content(content: str):
         if t.startswith("/"):
             m = SECTION_PAT.match(t.lower())
             if m:
-                normalized = m.group(1)                    # e.g. 'week_2'
-                normalized = normalized.replace("_", "").replace(" ", "")  # 'week2'
-                section_name = "Week" + normalized[len("week"):]           # 'Week2'
+                normalized = m.group(1)                                  # e.g., 'week_7'
+                normalized = normalized.replace("_", "").replace(" ", "")  # 'week7'
+                section_name = "Week" + normalized[len("week"):]           # 'Week7'
                 continue
         title_parts.append(t)
 
@@ -130,7 +148,7 @@ def parse_content(content: str):
     return title, labels, section_name
 
 def create_task(project_id: int, sections: dict, title: str, labels: list[str],
-                section_name: str | None, due_iso: str | None,
+                section_name: str | None, date_s: str | None, time_s: str | None,
                 description: str, priority: int):
     if not title:
         print("Skipping row with empty title/CONTENT.")
@@ -144,9 +162,15 @@ def create_task(project_id: int, sections: dict, title: str, labels: list[str],
     }
     if description:
         payload["description"] = description
-    if due_iso:
-        payload["due_datetime"] = due_iso
+
+    # Due handling: all-day if time missing; timed if both provided
+    iso = to_iso(date_s, time_s)
+    if date_s and not time_s:
+        payload["due_date"] = date_s.strip()
+    elif iso:
+        payload["due_datetime"] = iso
         payload["due_lang"] = "en"
+
     if section_name:
         sid = sections.get(section_name)
         if not sid:
@@ -174,12 +198,17 @@ def read_rows(csv_path: str):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--csv", default=None, help="Path to csv file or folder (optional)")
+    parser.add_argument("--token", default=None, help="Todoist API token (optional; env TODOIST_TOKEN also works)")
     args = parser.parse_args()
+
+    token = load_token(args.token)
+    global HEADERS
+    HEADERS = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
     csv_path = latest_downloaded_csv(args.csv)
     print(f"Using CSV: {csv_path}")
 
-    project_id = get_project_id(PROJECT_NAME)
+    project_id = get_project_id(PROJECT_NAME, HEADERS)
     sections_map = get_sections_map(project_id)
 
     count = 0
@@ -187,11 +216,13 @@ def main():
         content = r.get("CONTENT", "")
         title, labels, section_name = parse_content(content)
 
-        due_iso = to_iso(r.get("DUE_DATE"), r.get("DUE_TIME"))
+        date_s = r.get("DUE_DATE", "")
+        time_s = r.get("DUE_TIME", "")  # may be empty/absent for all-day
         priority = to_priority(r.get("PRIORITY"))
         description = r.get("DESCRIPTION", "")
 
-        create_task(project_id, sections_map, title, labels, section_name, due_iso, description, priority)
+        create_task(project_id, sections_map, title, labels, section_name,
+                    date_s, time_s, description, priority)
         count += 1
 
     print(f"Done. Created {count} task(s).")
